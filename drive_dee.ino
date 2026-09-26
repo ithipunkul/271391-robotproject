@@ -1,0 +1,582 @@
+#include <Arduino.h>
+#include <Bluepad32.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// PCA9685: original pins, channels and pulse values
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define PCA9685_ADDRESS 0x40
+#define BASE_SERVO_CHANNEL 0
+#define TILT_SERVO_CHANNEL 15
+
+Adafruit_PWMServoDriver pca9685(PCA9685_ADDRESS);
+
+const uint16_t BASE_LEFT_US = 2000;
+const uint16_t BASE_RIGHT_US = 1000;
+const uint16_t TILT_UP_US = 1000;
+const uint16_t TILT_DOWN_US = 2000;
+
+uint8_t previousDpad = 0xFF;
+bool pcaReady = false;
+bool failsafeActive = false;
+unsigned long lastRxLog = 0;
+
+void runServo(uint8_t channel, uint16_t pulseUs) {
+  if (!pcaReady) return;
+  pulseUs = constrain(pulseUs, 500, 2500);
+  pca9685.writeMicroseconds(channel, pulseUs);
+}
+
+void stopServo(uint8_t channel) {
+  if (!pcaReady) return;
+  pca9685.setPWM(channel, 0, 4096);
+}
+
+void stopAllServos() {
+  stopServo(BASE_SERVO_CHANNEL);
+  stopServo(TILT_SERVO_CHANNEL);
+}
+
+
+// =====================================================
+// PS4 Controller
+// =====================================================
+
+ControllerPtr controller = nullptr;
+
+unsigned long lastControllerData = 0;
+const unsigned long FAILSAFE_TIME = 500;
+const int JOYSTICK_DEADZONE = 60;
+
+
+// =====================================================
+// ความเร็วรถ
+//
+// 0 = หยุด
+// 1 = ช้า
+// 2 = ปานกลาง
+// 3 = เร็ว
+// =====================================================
+
+const float DRIVE_SPEED_STOP = 0.0f;
+const float DRIVE_SPEED_SLOW = 0.35f;
+const float DRIVE_SPEED_MEDIUM = 0.65f;
+const float DRIVE_SPEED_FAST = 1.0f;
+
+int driveSpeedMode = 0;
+float driveSpeedMultiplier = DRIVE_SPEED_STOP;
+
+
+// =====================================================
+// ความเร็วแปรง
+// =====================================================
+
+// แปรงหน้า
+const int FRONT_BRUSH_SPEED = 120;
+
+// แปรงหลัก/แปรงกลาง
+const int MAIN_BRUSH_SPEED_SLOW = 100;
+const int MAIN_BRUSH_SPEED_MEDIUM = 120;
+
+
+// =====================================================
+// สถานะแปรง
+// =====================================================
+
+bool frontBrushOn = false;
+
+// 0 = ปิด
+// 1 = ช้า PWM 100
+// 2 = ปานกลาง PWM 120
+int centerBrushLevel = 0;
+
+
+// =====================================================
+// ตรวจจับการกดปุ่มครั้งเดียว
+// =====================================================
+
+bool previousCrossState = false;
+bool previousSquareState = false;
+bool previousCircleState = false;
+
+
+// =====================================================
+// MDD3A ตัวที่ 1: ชุดขับเคลื่อนรถ
+//
+// M1A/M1B = ล้อซ้าย
+// M2A/M2B = ล้อขวา
+// =====================================================
+
+const int DRIVE_LEFT_A_PIN = 25;
+const int DRIVE_LEFT_B_PIN = 26;
+
+const int DRIVE_RIGHT_A_PIN = 32;
+const int DRIVE_RIGHT_B_PIN = 33;  
+
+const int DRIVE_LEFT_A_CHANNEL = 0;
+const int DRIVE_LEFT_B_CHANNEL = 1;
+const int DRIVE_RIGHT_A_CHANNEL = 2;
+const int DRIVE_RIGHT_B_CHANNEL = 3;
+
+
+// =====================================================
+// MDD3A ตัวที่ 2: ชุดแปรง
+//
+// M1A/M1B = แปรงหน้า
+// M2A/M2B = แปรงหลัก/แปรงกลาง
+// =====================================================
+
+const int FRONT_BRUSH_A_PIN = 16;
+const int FRONT_BRUSH_B_PIN = 17;
+
+const int CENTER_BRUSH_A_PIN = 18;
+const int CENTER_BRUSH_B_PIN = 19;
+
+const int FRONT_BRUSH_A_CHANNEL = 4;
+const int FRONT_BRUSH_B_CHANNEL = 5;
+const int CENTER_BRUSH_A_CHANNEL = 6;
+const int CENTER_BRUSH_B_CHANNEL = 7;
+
+
+// =====================================================
+// PWM Settings
+// =====================================================
+
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;
+
+
+// =====================================================
+// สั่งมอเตอร์ MDD3A
+//
+// speed: -255 ถึง 255
+// =====================================================
+
+void setMotor(int channelA, int channelB, int speed) {
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0) {
+    ledcWrite(channelA, speed);
+    ledcWrite(channelB, 0);
+  }
+  else if (speed < 0) {
+    ledcWrite(channelA, 0);
+    ledcWrite(channelB, -speed);
+  }
+  else {
+    ledcWrite(channelA, 0);
+    ledcWrite(channelB, 0);
+  }
+}
+
+
+// =====================================================
+// ควบคุมล้อรถแบบ Differential Drive
+// =====================================================
+
+void driveRobot(float leftSpeed, float rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -1.0f, 1.0f);
+  rightSpeed = constrain(rightSpeed, -1.0f, 1.0f);
+
+  int leftPwm = (int)(leftSpeed * 255.0f);
+  int rightPwm = (int)(rightSpeed * 255.0f);
+
+  setMotor(
+    DRIVE_LEFT_A_CHANNEL,
+    DRIVE_LEFT_B_CHANNEL,
+    leftPwm
+  );
+
+  setMotor(
+    DRIVE_RIGHT_A_CHANNEL,
+    DRIVE_RIGHT_B_CHANNEL,
+    rightPwm
+  );
+}
+
+
+// =====================================================
+// ควบคุมแปรง
+// =====================================================
+
+void updateBrushes() {
+  // แปรงหน้า: ปัดเศษเข้าใต้ท้องรถ
+  setMotor(
+    FRONT_BRUSH_A_CHANNEL,
+    FRONT_BRUSH_B_CHANNEL,
+    frontBrushOn ? FRONT_BRUSH_SPEED : 0
+  );
+
+  // แปรงหลัก: ปิด -> ช้า PWM 100 -> ปานกลาง PWM 120
+  int mainBrushSpeed = 0;
+
+  if (centerBrushLevel == 1) {
+    mainBrushSpeed = -MAIN_BRUSH_SPEED_SLOW;
+  }
+  else if (centerBrushLevel == 2) {
+    mainBrushSpeed = -MAIN_BRUSH_SPEED_MEDIUM;
+  }
+
+  setMotor(
+    CENTER_BRUSH_A_CHANNEL,
+    CENTER_BRUSH_B_CHANNEL,
+    mainBrushSpeed
+  );
+}
+
+
+// =====================================================
+// หยุดทุกมอเตอร์
+// =====================================================
+
+void stopAllMotors() {
+  driveRobot(0.0f, 0.0f);
+
+  setMotor(
+    FRONT_BRUSH_A_CHANNEL,
+    FRONT_BRUSH_B_CHANNEL,
+    0
+  );
+
+  setMotor(
+    CENTER_BRUSH_A_CHANNEL,
+    CENTER_BRUSH_B_CHANNEL,
+    0
+  );
+}
+
+
+// =====================================================
+// รีเซ็ตสถานะทุกอย่าง
+// =====================================================
+
+void resetRobotState() {
+  driveSpeedMode = 0;
+  driveSpeedMultiplier = DRIVE_SPEED_STOP;
+
+  frontBrushOn = false;
+  centerBrushLevel = 0;
+
+  previousCrossState = false;
+  previousSquareState = false;
+  previousCircleState = false;
+
+  stopAllMotors();
+  stopAllServos();
+  previousDpad = 0xFF;
+}
+
+
+// =====================================================
+// Deadzone ของจอย
+// =====================================================
+
+float applyDeadzone(int value, int deadzone) {
+  if (abs(value) <= deadzone) {
+    return 0.0f;
+  }
+
+  if (value > 0) {
+    return (float)(value - deadzone) / (512.0f - deadzone);
+  }
+
+  return (float)(value + deadzone) / (512.0f - deadzone);
+}
+
+
+// =====================================================
+// Bluepad32 callbacks
+// =====================================================
+
+void onConnectedController(ControllerPtr ctl) {
+  if (controller == nullptr) {
+    controller = ctl;
+    lastControllerData = millis();
+    failsafeActive = false;
+
+    resetRobotState();
+
+    Serial.println();
+    Serial.println("PS4 controller connected");
+    Serial.print("Model: ");
+    Serial.println(ctl->getModelName());
+  }
+}
+
+
+void onDisconnectedController(ControllerPtr ctl) {
+  if (controller == ctl) {
+    controller = nullptr;
+
+    resetRobotState();
+
+    Serial.println("PS4 controller disconnected");
+    Serial.println("All motors and servos stopped");
+  }
+}
+
+
+// =====================================================
+// อ่านจอย PS4
+// =====================================================
+
+void processController() {
+  if (controller == nullptr ||
+      !controller->isConnected() ||
+      !controller->isGamepad()) {
+    stopAllMotors();
+    stopAllServos();
+    return;
+  }
+
+  if (!controller->hasData()) {
+    return;
+  }
+
+  lastControllerData = millis();
+  failsafeActive = false;
+
+  // Print actual received values at most four times per second.
+  if (millis() - lastRxLog >= 250) {
+    lastRxLog = millis();
+    Serial.printf("RX: dpad=0x%02X X=%d Square=%d Circle=%d Y=%d RX=%d\n",
+                  controller->dpad(), controller->a(), controller->x(),
+                  controller->b(), controller->axisY(), controller->axisRX());
+  }
+
+  // ---------------------------------------------------
+  // X: หยุด -> ช้า -> ปานกลาง -> เร็ว -> หยุด
+  // a() = ปุ่ม Cross / X
+  // ---------------------------------------------------
+
+  bool crossPressed = controller->a();
+
+  if (crossPressed && !previousCrossState) {
+    driveSpeedMode++;
+
+    if (driveSpeedMode > 3) {
+      driveSpeedMode = 0;
+    }
+
+    if (driveSpeedMode == 0) {
+      driveSpeedMultiplier = DRIVE_SPEED_STOP;
+      Serial.println("Drive speed: STOP");
+    }
+    else if (driveSpeedMode == 1) {
+      driveSpeedMultiplier = DRIVE_SPEED_SLOW;
+      Serial.println("Drive speed: SLOW");
+    }
+    else if (driveSpeedMode == 2) {
+      driveSpeedMultiplier = DRIVE_SPEED_MEDIUM;
+      Serial.println("Drive speed: MEDIUM");
+    }
+    else {
+      driveSpeedMultiplier = DRIVE_SPEED_FAST;
+      Serial.println("Drive speed: FAST");
+    }
+  }
+
+  previousCrossState = crossPressed;
+
+
+  // ---------------------------------------------------
+  // Square: เปิด/ปิดแปรงหน้า
+  // x() = ปุ่ม Square
+  // ---------------------------------------------------
+
+  bool squarePressed = controller->x();
+
+  if (squarePressed && !previousSquareState) {
+    frontBrushOn = !frontBrushOn;
+
+    Serial.print("Front brush: ");
+    Serial.println(frontBrushOn ? "ON" : "OFF");
+  }
+
+  previousSquareState = squarePressed;
+
+
+  // ---------------------------------------------------
+  // O: ปิด -> ช้า -> ปานกลาง -> ปิด
+  // b() = ปุ่ม Circle / O
+  // ---------------------------------------------------
+
+  bool circlePressed = controller->b();
+
+  if (circlePressed && !previousCircleState) {
+    centerBrushLevel++;
+
+    if (centerBrushLevel > 2) {
+      centerBrushLevel = 0;
+    }
+
+    if (centerBrushLevel == 0) {
+      Serial.println("Main brush: OFF");
+    }
+    else if (centerBrushLevel == 1) {
+      Serial.println("Main brush: SLOW | PWM = 100");
+    }
+    else {
+      Serial.println("Main brush: MEDIUM | PWM = 120");
+    }
+  }
+
+  previousCircleState = circlePressed;
+
+
+  // ---------------------------------------------------
+  // ก้านซ้าย Y: เดินหน้า / ถอยหลัง
+  // ก้านขวา X: เลี้ยวซ้าย / ขวา
+  // ---------------------------------------------------
+
+  float throttle = applyDeadzone(
+    controller->axisY(),
+    JOYSTICK_DEADZONE
+  );
+
+  float steering = -applyDeadzone(
+    controller->axisRX(),
+    JOYSTICK_DEADZONE
+  );
+
+  throttle *= driveSpeedMultiplier;
+  steering *= driveSpeedMultiplier;
+
+  float leftMotor = throttle + steering;
+  float rightMotor = throttle - steering;
+
+  float maxValue = max(
+    fabsf(leftMotor),
+    fabsf(rightMotor)
+  );
+
+  if (maxValue > 1.0f) {
+    leftMotor /= maxValue;
+    rightMotor /= maxValue;
+  }
+
+  driveRobot(leftMotor, rightMotor);
+  updateBrushes();
+
+  // D-pad controls the camera servos independently of drive speed.
+  uint8_t dpad = controller->dpad();
+  if (dpad != previousDpad) {
+    Serial.printf("D-Pad: 0x%02X\n", dpad);
+    previousDpad = dpad;
+  }
+
+  bool leftPressed = dpad & DPAD_LEFT;
+  bool rightPressed = dpad & DPAD_RIGHT;
+  bool upPressed = dpad & DPAD_UP;
+  bool downPressed = dpad & DPAD_DOWN;
+
+  if (leftPressed && !rightPressed) {
+    runServo(BASE_SERVO_CHANNEL, BASE_LEFT_US);
+  } else if (rightPressed && !leftPressed) {
+    runServo(BASE_SERVO_CHANNEL, BASE_RIGHT_US);
+  } else {
+    stopServo(BASE_SERVO_CHANNEL);
+  }
+
+  if (upPressed && !downPressed) {
+    runServo(TILT_SERVO_CHANNEL, TILT_UP_US);
+  } else if (downPressed && !upPressed) {
+    runServo(TILT_SERVO_CHANNEL, TILT_DOWN_US);
+  } else {
+    stopServo(TILT_SERVO_CHANNEL);
+  }
+}
+
+
+// =====================================================
+// ตั้งค่า PWM แต่ละขา
+// =====================================================
+
+void setupPwmPin(int pin, int channel) {
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+
+  ledcSetup(
+    channel,
+    PWM_FREQUENCY,
+    PWM_RESOLUTION
+  );
+
+  ledcAttachPin(pin, channel);
+
+  ledcWrite(channel, 0);
+}
+
+
+// =====================================================
+// Setup
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  delay(1000);
+
+  setupPwmPin(DRIVE_LEFT_A_PIN, DRIVE_LEFT_A_CHANNEL);
+  setupPwmPin(DRIVE_LEFT_B_PIN, DRIVE_LEFT_B_CHANNEL);
+  setupPwmPin(DRIVE_RIGHT_A_PIN, DRIVE_RIGHT_A_CHANNEL);
+  setupPwmPin(DRIVE_RIGHT_B_PIN, DRIVE_RIGHT_B_CHANNEL);
+
+  setupPwmPin(FRONT_BRUSH_A_PIN, FRONT_BRUSH_A_CHANNEL);
+  setupPwmPin(FRONT_BRUSH_B_PIN, FRONT_BRUSH_B_CHANNEL);
+  setupPwmPin(CENTER_BRUSH_A_PIN, CENTER_BRUSH_A_CHANNEL);
+  setupPwmPin(CENTER_BRUSH_B_PIN, CENTER_BRUSH_B_CHANNEL);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  Wire.setTimeOut(20);
+  pcaReady = pca9685.begin();
+  if (pcaReady) {
+    pca9685.setOscillatorFrequency(27000000);
+    pca9685.setPWMFreq(50);
+    delay(10);
+    stopAllServos();
+  } else {
+    Serial.println("ERROR: PCA9685 not detected; camera outputs disabled");
+  }
+
+  resetRobotState();
+
+  BP32.setup(
+    &onConnectedController,
+    &onDisconnectedController
+  );
+
+  BP32.enableVirtualDevice(false);
+
+  if (pcaReady) Serial.println("PCA9685 detected");
+  Serial.println("LEFT / RIGHT = Base");
+  Serial.println("UP / DOWN = Tilt");
+  Serial.println("Ready.");
+  Serial.println("X: Drive STOP -> SLOW -> MEDIUM -> FAST -> STOP");
+  Serial.println("Square: Front brush ON/OFF");
+  Serial.println("Circle: Main brush OFF -> PWM 100 -> PWM 120 -> OFF");
+}
+
+
+// =====================================================
+// Loop
+// =====================================================
+
+void loop() {
+  bool dataUpdated = BP32.update();
+  if (dataUpdated) {
+    processController();
+  }
+
+  // Failsafe: ถ้าจอยหลุดหรือไม่มีข้อมูลเกิน 0.5 วินาที
+  if (controller != nullptr && !failsafeActive &&
+      millis() - lastControllerData > FAILSAFE_TIME) {
+    resetRobotState();
+    failsafeActive = true;
+    Serial.println("FAILSAFE: no gamepad data for 500 ms; all outputs stopped");
+  }
+
+  delay(10);
+}
