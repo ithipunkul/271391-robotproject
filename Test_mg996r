@@ -1,0 +1,172 @@
+#include <Arduino.h>
+#include <Bluepad32.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// =====================================================
+// PCA9685
+// =====================================================
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define PCA9685_ADDRESS 0x40
+
+// แก้ให้ตรงกับช่องที่เสียบจริง
+#define BASE_SERVO_CHANNEL 0
+#define TILT_SERVO_CHANNEL 15
+
+Adafruit_PWMServoDriver pca9685(PCA9685_ADDRESS);
+
+// ใช้ช่วงกว้างเพื่อให้หมุนคนละทิศอย่างชัดเจน
+const uint16_t BASE_LEFT_US  = 2000;
+const uint16_t BASE_RIGHT_US = 1000;
+
+const uint16_t TILT_UP_US   = 1000;
+const uint16_t TILT_DOWN_US = 2000;
+
+ControllerPtr controller = nullptr;
+uint8_t previousDpad = 0xFF;
+
+// =====================================================
+// Servo control
+// =====================================================
+
+void runServo(uint8_t channel, uint16_t pulseUs) {
+  pulseUs = constrain(pulseUs, 500, 2500);
+  pca9685.writeMicroseconds(channel, pulseUs);
+}
+
+// ตัดสัญญาณช่องนั้นเมื่อปล่อยปุ่ม
+void stopServo(uint8_t channel) {
+  pca9685.setPWM(channel, 0, 4096);
+}
+
+void stopAllServos() {
+  stopServo(BASE_SERVO_CHANNEL);
+  stopServo(TILT_SERVO_CHANNEL);
+}
+
+// =====================================================
+// Controller callbacks
+// =====================================================
+
+void onConnectedController(ControllerPtr ctl) {
+  if (controller == nullptr) {
+    controller = ctl;
+    previousDpad = 0xFF;
+
+    stopAllServos();
+
+    Serial.println("Controller connected");
+  }
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+  if (controller == ctl) {
+    controller = nullptr;
+    previousDpad = 0xFF;
+
+    stopAllServos();
+
+    Serial.println("Controller disconnected");
+    Serial.println("All servos stopped");
+  }
+}
+
+// =====================================================
+// D-pad control
+// =====================================================
+
+void processController() {
+  if (controller == nullptr ||
+      !controller->isConnected() ||
+      !controller->isGamepad()) {
+    stopAllServos();
+    return;
+  }
+
+  uint8_t dpad = controller->dpad();
+
+  if (dpad != previousDpad) {
+    Serial.printf("D-Pad: 0x%02X\n", dpad);
+    previousDpad = dpad;
+  }
+
+  bool leftPressed  = dpad & DPAD_LEFT;
+  bool rightPressed = dpad & DPAD_RIGHT;
+  bool upPressed    = dpad & DPAD_UP;
+  bool downPressed  = dpad & DPAD_DOWN;
+
+  // ฐาน: ซ้าย/ขวา
+  if (leftPressed && !rightPressed) {
+    runServo(BASE_SERVO_CHANNEL, BASE_LEFT_US);
+  }
+  else if (rightPressed && !leftPressed) {
+    runServo(BASE_SERVO_CHANNEL, BASE_RIGHT_US);
+  }
+  else {
+    stopServo(BASE_SERVO_CHANNEL);
+  }
+
+  // ก้มเงย: ขึ้น/ลง
+  if (upPressed && !downPressed) {
+    runServo(TILT_SERVO_CHANNEL, TILT_UP_US);
+  }
+  else if (downPressed && !upPressed) {
+    runServo(TILT_SERVO_CHANNEL, TILT_DOWN_US);
+  }
+  else {
+    stopServo(TILT_SERVO_CHANNEL);
+  }
+}
+
+// =====================================================
+// Setup
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println();
+  Serial.println("Starting camera servo controller");
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  if (!pca9685.begin()) {
+    Serial.println("ERROR: PCA9685 not detected");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // ค่าทั่วไปสำหรับ PCA9685 หลายรุ่น
+  pca9685.setOscillatorFrequency(27000000);
+  pca9685.setPWMFreq(50);
+  delay(10);
+
+  stopAllServos();
+
+  BP32.setup(
+    &onConnectedController,
+    &onDisconnectedController
+  );
+
+  BP32.enableVirtualDevice(false);
+
+  Serial.println("PCA9685 detected");
+  Serial.println("Waiting for controller");
+  Serial.println("LEFT / RIGHT = Base");
+  Serial.println("UP / DOWN = Tilt");
+}
+
+// =====================================================
+// Main loop
+// =====================================================
+
+void loop() {
+  BP32.update();
+  processController();
+  delay(10);
+}
